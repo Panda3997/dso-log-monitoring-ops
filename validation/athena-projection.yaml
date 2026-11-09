@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Config 로그 분석용 Athena 환경 (파티션 프로젝션).
+  1차 배포: DeployTable=false  -> 버킷, 워크그룹, DB만 생성
+  2차 배포: DeployTable=true   -> 파티션 프로젝션 테이블 추가
+
+Parameters:
+  DeployTable:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: 파티션 프로젝션 테이블 생성 여부
+  ProjectionStartDate:
+    Type: String
+    Default: '2026/10/1'
+    Description: Config 파티션 계산 시작일 (yyyy/M/d 형식, 월·일에 0을 붙이지 않음)
+  CloudTrailProjectionStartDate:
+    Type: String
+    Default: '2026/10/01'
+    Description: CloudTrail 파티션 계산 시작일 (yyyy/MM/dd 형식, 월·일에 0을 붙임)
+
+Conditions:
+  CreateTable: !Equals [!Ref DeployTable, 'true']
+
+Resources:
+  # Config 로그 저장 버킷
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'dso-config-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Athena 쿼리 결과 버킷 (결과 파일은 7일 후 자동 삭제)
+  AthenaResultBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'dso-athena-results-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-query-results
+            Status: Enabled
+            ExpirationInDays: 7
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: dso-workgroup
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultBucket}/results/'
+
+  ConfigLogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: config_logs
+
+  # 파티션 프로젝션 테이블 (2차 배포에서 생성)
+  ConfigHistoryTable:
+    Type: AWS::Glue::Table
+    Condition: CreateTable
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref ConfigLogDatabase
+      TableInput:
+        Name: config_history
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        Parameters:
+          classification: json
+          projection.enabled: 'true'
+          projection.dt.type: date
+          projection.dt.format: yyyy/M/d
+          projection.dt.range: !Sub '${ProjectionStartDate},NOW'
+          projection.dt.interval: '1'
+          projection.dt.interval.unit: DAYS
+          # ${!dt} : !Sub가 dt를 CloudFormation 변수로 해석하지 않도록 이스케이프
+          storage.location.template: !Sub 's3://${LogBucket}/AWSLogs/${AWS::AccountId}/Config/${AWS::Region}/${!dt}/ConfigHistory/'
+        StorageDescriptor:
+          Location: !Sub 's3://${LogBucket}/AWSLogs/${AWS::AccountId}/Config/${AWS::Region}/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+            - Name: fileversion
+              Type: string
+            - Name: configurationitems
+              Type: 'array<struct<configurationitemcapturetime:string,resourcetype:string,resourceid:string,resourcename:string,awsregion:string,configuration:struct<configrulelist:array<struct<configrulename:string,compliancetype:string>>>>>'
+
+  CloudTrailLogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: cloudtrail_logs
+
+  # CloudTrail 파티션 프로젝션 테이블 (2차 배포에서 생성)
+  # Config와 달리 경로 날짜에 0이 붙으므로 형식이 yyyy/MM/dd
+  CloudTrailTable:
+    Type: AWS::Glue::Table
+    Condition: CreateTable
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CloudTrailLogDatabase
+      TableInput:
+        Name: cloudtrail_events
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        Parameters:
+          classification: cloudtrail
+          projection.enabled: 'true'
+          projection.dt.type: date
+          projection.dt.format: yyyy/MM/dd
+          projection.dt.range: !Sub '${CloudTrailProjectionStartDate},NOW'
+          projection.dt.interval: '1'
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${LogBucket}/AWSLogs/${AWS::AccountId}/CloudTrail/${AWS::Region}/${!dt}/'
+        StorageDescriptor:
+          Location: !Sub 's3://${LogBucket}/AWSLogs/${AWS::AccountId}/CloudTrail/${AWS::Region}/'
+          InputFormat: com.amazon.emr.cloudtrail.CloudTrailInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hive.hcatalog.data.JsonSerDe
+          Columns:
+            - Name: eventversion
+              Type: string
+            - Name: useridentity
+              Type: 'struct<type:string,principalid:string,arn:string,accountid:string,username:string>'
+            - Name: eventtime
+              Type: string
+            - Name: eventsource
+              Type: string
+            - Name: eventname
+              Type: string
+            - Name: awsregion
+              Type: string
+            - Name: sourceipaddress
+              Type: string
+            - Name: useragent
+              Type: string
+            - Name: errorcode
+              Type: string
+            - Name: errormessage
+              Type: string
+            - Name: requestid
+              Type: string
+            - Name: eventid
+              Type: string
+            - Name: readonly
+              Type: string
+            - Name: eventtype
+              Type: string
+            - Name: recipientaccountid
+              Type: string
+
+Outputs:
+  LogBucketName:
+    Value: !Ref LogBucket
+  AthenaResultBucketName:
+    Value: !Ref AthenaResultBucket
+  WorkGroupName:
+    Value: !Ref AthenaWorkGroup

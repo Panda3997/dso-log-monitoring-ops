@@ -1,0 +1,347 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  [v2] Integrated log monitoring - ops stack.
+  Daily compliance check (Lambda, EventBridge Scheduler), alerts (SNS)
+  and pipeline self-monitoring (CloudWatch alarms). Imports outputs from dso-base.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address for security and ops alerts
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(0 1 * * ? *)'
+    Description: Check time in UTC (previous day Config logs are delivered around 00:30 UTC)
+  ScheduleState:
+    Type: String
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Default: 'ENABLED'
+    Description: Set DISABLED only to test the not-running alarm
+  EnableMonitoring:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Create pipeline self-monitoring alarms
+  RunbookUrl:
+    Type: String
+    Default: ''
+    Description: Runbook URL included in security alert emails (e.g. blog post)
+  HeartbeatPeriodSeconds:
+    Type: Number
+    Default: 86400
+    AllowedValues: [3600, 86400]
+    Description: Not-running alarm period. 86400 normally, 3600 only for testing
+
+Conditions:
+  CreateMonitoring: !Equals [!Ref EnableMonitoring, 'true']
+
+Resources:
+  ############### [1부] 알림 ###############
+
+  # 보안 위반 알림 (v1의 dso-security-alerts)
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: dso-security-alerts
+
+  SecurityAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref SecurityAlertTopic
+
+  # 시스템 장애 알림 (v2 신규): 보안 위반과 파이프라인 장애를 분리
+  OpsAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateMonitoring
+    Properties:
+      TopicName: dso-ops-alerts
+
+  OpsAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateMonitoring
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref OpsAlertTopic
+
+  ############### [2부] 규정 준수 자동 점검 ###############
+
+  ComplianceCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/dso-compliance-check
+      RetentionInDays: 30
+
+  ComplianceCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dso-compliance-check-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: dso-compliance-check
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${ComplianceCheckLogGroup.Arn}'
+              - Sid: Athena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: !Sub
+                  - 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WG}'
+                  - WG: !ImportValue dso-base-WorkGroup
+              - Sid: GlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub
+                    - 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DB}'
+                    - DB: !ImportValue dso-base-ConfigDatabase
+                  - !Sub
+                    - 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DB}/*'
+                    - DB: !ImportValue dso-base-ConfigDatabase
+              - Sid: ReadLogs
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${B}'
+                    - B: !ImportValue dso-base-LogBucket
+                  - !Sub
+                    - 'arn:aws:s3:::${B}/AWSLogs/${AWS::AccountId}/Config/*'
+                    - B: !ImportValue dso-base-LogBucket
+              - Sid: WriteQueryResults
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${B}'
+                    - B: !ImportValue dso-base-AthenaResultBucket
+                  - !Sub
+                    - 'arn:aws:s3:::${B}/*'
+                    - B: !ImportValue dso-base-AthenaResultBucket
+              - Sid: PublishAlert
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SecurityAlertTopic
+
+  ComplianceCheckFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ComplianceCheckLogGroup
+    Properties:
+      FunctionName: dso-compliance-check
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 90
+      Role: !GetAtt ComplianceCheckRole.Arn
+      Environment:
+        Variables:
+          DATABASE: !ImportValue dso-base-ConfigDatabase
+          TABLE: !ImportValue dso-base-ConfigTable
+          WORKGROUP: !ImportValue dso-base-WorkGroup
+          SNS_TOPIC_ARN: !Ref SecurityAlertTopic
+          RULE_NAME: s3-bucket-public-read-prohibited
+          SEVERITY: HIGH
+          RUNBOOK_URL: !Ref RunbookUrl
+      Code:
+        ZipFile: |
+          import os
+          import time
+          import datetime
+          import boto3
+
+          athena = boto3.client('athena')
+          sns = boto3.client('sns')
+
+          DATABASE = os.environ['DATABASE']
+          TABLE = os.environ['TABLE']
+          WORKGROUP = os.environ['WORKGROUP']
+          SNS_TOPIC = os.environ['SNS_TOPIC_ARN']
+          RULE_NAME = os.environ['RULE_NAME']
+          SEVERITY = os.environ.get('SEVERITY', 'HIGH')
+          RUNBOOK_URL = os.environ.get('RUNBOOK_URL', '')
+          REGION = os.environ.get('AWS_REGION', '')
+
+
+          def lambda_handler(event, context):
+              target = (event or {}).get('target_date')
+              if not target:
+                  y = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+                  target = f"{y.year}/{y.month}/{y.day}"
+
+              # [개선 4] LIMIT 1 제거: 위반 리소스를 모두 알림
+              query = f"""
+              SELECT DISTINCT rel.resourceid
+              FROM {TABLE}
+              CROSS JOIN UNNEST(configurationitems) AS t(item)
+              CROSS JOIN UNNEST(item.relationships) AS t2(rel)
+              CROSS JOIN UNNEST(item.configuration.configrulelist) AS t3(rule)
+              WHERE dt = '{target}'
+                AND rule.configrulename = '{RULE_NAME}'
+                AND rule.compliancetype = 'NON_COMPLIANT'
+              ORDER BY 1
+              """
+              rows = run_athena_query(query)
+              resources = [r['Data'][0].get('VarCharValue', '(unknown)') for r in rows[1:]]
+
+              if not resources:
+                  print(f"No NON_COMPLIANT result (dt={target})")
+                  return {'status': 'no_violation', 'dt': target}
+
+              now_kst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+              lines = [
+                  f"[보안 규정 위반] {RULE_NAME}",
+                  "",
+                  f"- 심각도: {SEVERITY}",
+                  f"- 위반 리소스 ({len(resources)}건):",
+              ]
+              lines += [f"    * {r}" for r in resources]
+              lines += [
+                  f"- 리전: {REGION}",
+                  f"- 점검 대상 로그 날짜(UTC): {target}",
+                  f"- 점검 시각(KST): {now_kst:%Y-%m-%d %H:%M}",
+                  f"- 대응 절차(런북): {RUNBOOK_URL or '(미등록)'}",
+              ]
+              # SNS 이메일 제목은 ASCII만 허용
+              sns.publish(
+                  TopicArn=SNS_TOPIC,
+                  Subject=f"[SECURITY][{SEVERITY}] {RULE_NAME} - {len(resources)} resource(s)"[:100],
+                  Message="\n".join(lines)
+              )
+              print(f"SNS sent: {resources} (dt={target})")
+              return {'status': 'violation', 'dt': target, 'resources': resources}
+
+
+          def run_athena_query(query):
+              qid = athena.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': DATABASE},
+                  WorkGroup=WORKGROUP
+              )['QueryExecutionId']
+
+              state = 'QUEUED'
+              for _ in range(30):
+                  time.sleep(2)
+                  status = athena.get_query_execution(QueryExecutionId=qid)['QueryExecution']['Status']
+                  state = status['State']
+                  if state in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+                      break
+
+              if state != 'SUCCEEDED':
+                  reason = status.get('StateChangeReason', state)
+                  raise RuntimeError(f"Athena query {state}: {reason}")
+
+              return athena.get_query_results(QueryExecutionId=qid)['ResultSet']['Rows']
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dso-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: dso-invoke-compliance-check
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ComplianceCheckFunction.Arn
+
+  DailyCheckSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: dso-daily-compliance-check
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      State: !Ref ScheduleState
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt ComplianceCheckFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+
+  ############### [3부] 파이프라인 자체 모니터링 (운영 개선 2) ###############
+
+  # Lambda 실행 오류 (Athena 실패, SNS 발송 실패 포함)
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateMonitoring
+    Properties:
+      AlarmName: dso-compliance-check-errors
+      AlarmDescription: Compliance check Lambda failed
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ComplianceCheckFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertTopic]
+      OKActions: [!Ref OpsAlertTopic]
+
+  # 정해진 기간 동안 한 번도 실행되지 않음 (스케줄 누락 감지)
+  LambdaHeartbeatAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateMonitoring
+    Properties:
+      AlarmName: dso-compliance-check-not-running
+      AlarmDescription: Compliance check Lambda did not run within the period
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ComplianceCheckFunction
+      Statistic: Sum
+      Period: !Ref HeartbeatPeriodSeconds
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref OpsAlertTopic]
+      OKActions: [!Ref OpsAlertTopic]
+
+Outputs:
+  ComplianceCheckFunctionName:
+    Value: !Ref ComplianceCheckFunction
+  SecurityAlertTopicArn:
+    Value: !Ref SecurityAlertTopic

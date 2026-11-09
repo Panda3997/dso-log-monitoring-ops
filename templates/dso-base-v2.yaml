@@ -1,0 +1,373 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  [v2] Integrated log monitoring - base stack.
+  Log storage (S3), log collection (CloudTrail, Config) and analysis (Glue, Athena).
+  Athena tables use partition projection, so no partition registration step is needed.
+
+Parameters:
+  ConfigProjectionStartDate:
+    Type: String
+    Default: '2026/10/1'
+    Description: Config projection start date (yyyy/M/d, no zero padding)
+  CloudTrailProjectionStartDate:
+    Type: String
+    Default: '2026/10/01'
+    Description: CloudTrail projection start date (yyyy/MM/dd, zero padded)
+  EnableGuardDuty:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Not needed for the ops improvement work (default false to save cost)
+  EnableSecurityHub:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Not needed for the ops improvement work (default false to save cost)
+
+Conditions:
+  CreateGuardDuty: !Equals [!Ref EnableGuardDuty, 'true']
+  CreateSecurityHub: !Equals [!Ref EnableSecurityHub, 'true']
+
+Resources:
+  ############### [1부] 로그 저장 ###############
+
+  # CloudTrail, Config 로그를 함께 저장하는 버킷
+  # (v1에서는 콘솔에서 만든 버킷을 파라미터로 받았음)
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'dso-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # [운영 개선 3] 수명 주기 정책
+      # 0~30일: 자주 분석 (Standard) / 30~90일: 가끔 조회 (Standard-IA)
+      # 90일~: 감사 대비 보관만 (Glacier, Athena로 바로 조회 불가) / 365일: 삭제
+      # 참고: S3는 기본적으로 128KB 미만 객체를 등급 전환하지 않음
+      LifecycleConfiguration:
+        Rules:
+          - Id: log-tiering
+            Status: Enabled
+            Prefix: AWSLogs/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: 365
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  AthenaResultBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'dso-athena-results-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # [운영 개선 3] 쿼리 결과 파일은 재사용하지 않으므로 7일 후 삭제
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-query-results
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # v1은 CloudTrail 권한만 있었음. v2는 Config 전달 권한을 함께 넣고,
+  # 이 계정의 트레일·Config만 쓸 수 있도록 조건으로 좁힘
+  LogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt LogBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/dso-trail'
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LogBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/dso-trail'
+          - Sid: ConfigAclCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:ListBucket
+            Resource: !GetAtt LogBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: ConfigWrite
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LogBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ############### [2부] 로그 수집 ###############
+
+  # v1에서는 콘솔로 만들었던 트레일
+  # 트레일은 생성 즉시 버킷에 로그를 쓰므로 Config 구성이 모두 끝난 뒤 마지막에 생성
+  # (중간에 실패하면 버킷이 비어 있지 않아 롤백 삭제가 실패하는 문제 방지)
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - LogBucketPolicy
+      - S3PublicReadRule
+    Properties:
+      TrailName: dso-trail
+      S3BucketName: !Ref LogBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dso-config-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Policies:
+        - PolicyName: dso-config-s3-delivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetBucketAcl
+                Resource: !GetAtt LogBucket.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${LogBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+                Condition:
+                  StringLike:
+                    s3:x-amz-acl: bucket-owner-full-control
+
+  # 기록 대상을 S3 버킷과 규칙 준수 결과로 한정 (비용 절감)
+  # ResourceCompliance를 기록해야 ConfigHistory에 규칙 준수 결과가 남고, Lambda가 이를 조회함
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: default
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: false
+        IncludeGlobalResourceTypes: false
+        RecordingStrategy:
+          UseOnly: INCLUSION_BY_RESOURCE_TYPES
+        ResourceTypes:
+          - AWS::S3::Bucket
+          - AWS::Config::ResourceCompliance
+
+  # 레코더는 생성 직후 기록을 시작(Start)하는데, 이때 전달 채널이 있어야 함
+  # 채널이 레코더 완료를 기다리면 서로 기다리다 레코더가 안정화되지 못함 (v2 첫 배포 실패 원인)
+  # v1처럼 레코더에 의존하지 않고 함께 생성되게 둠
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: LogBucketPolicy
+    Properties:
+      Name: default
+      S3BucketName: !Ref LogBucket
+
+  # v1에서는 콘솔로 만들었던 규칙
+  S3PublicReadRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn:
+      - ConfigRecorder
+      - ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: s3-bucket-public-read-prohibited
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+
+  ############### [3부] 분석 기반 (Glue, Athena) ###############
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: dso-workgroup
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultBucket}/results/'
+
+  ConfigLogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: config_logs
+
+  CloudTrailLogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: cloudtrail_logs
+
+  # v1의 config_flat_confighistory와 같은 구조 + 파티션 프로젝션
+  # v1은 Lambda가 매일 ADD PARTITION으로 전날 파티션을 등록했음
+  # dt 값 형식이 yyyy-M-d -> yyyy/M/d 로 바뀌므로 Lambda 쿼리도 함께 변경
+  ConfigHistoryTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref ConfigLogDatabase
+      TableInput:
+        Name: config_flat_confighistory
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        Parameters:
+          classification: json
+          projection.enabled: 'true'
+          projection.dt.type: date
+          projection.dt.format: yyyy/M/d
+          projection.dt.range: !Sub '${ConfigProjectionStartDate},NOW'
+          projection.dt.interval: '1'
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${LogBucket}/AWSLogs/${AWS::AccountId}/Config/${AWS::Region}/${!dt}/ConfigHistory/'
+        StorageDescriptor:
+          Location: !Sub 's3://${LogBucket}/AWSLogs/${AWS::AccountId}/Config/${AWS::Region}/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+            - Name: configurationitems
+              Type: 'array<struct<configuration:struct<configRuleList:array<struct<configRuleName:string,complianceType:string>>>,relationships:array<struct<resourceId:string>>>>'
+
+  # 1단계 사전 검증에서 확인한 CloudTrail 테이블 + 파티션 프로젝션
+  # v1은 수동 테이블 + 날짜마다 수동 파티션 등록 후 QuickSight로 시각화했음
+  CloudTrailTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CloudTrailLogDatabase
+      TableInput:
+        Name: cloudtrail_events
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        Parameters:
+          classification: cloudtrail
+          projection.enabled: 'true'
+          projection.dt.type: date
+          projection.dt.format: yyyy/MM/dd
+          projection.dt.range: !Sub '${CloudTrailProjectionStartDate},NOW'
+          projection.dt.interval: '1'
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${LogBucket}/AWSLogs/${AWS::AccountId}/CloudTrail/${AWS::Region}/${!dt}/'
+        StorageDescriptor:
+          Location: !Sub 's3://${LogBucket}/AWSLogs/${AWS::AccountId}/CloudTrail/${AWS::Region}/'
+          InputFormat: com.amazon.emr.cloudtrail.CloudTrailInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hive.hcatalog.data.JsonSerDe
+          Columns:
+            - Name: eventversion
+              Type: string
+            - Name: useridentity
+              Type: 'struct<type:string,principalid:string,arn:string,accountid:string,username:string>'
+            - Name: eventtime
+              Type: string
+            - Name: eventsource
+              Type: string
+            - Name: eventname
+              Type: string
+            - Name: awsregion
+              Type: string
+            - Name: sourceipaddress
+              Type: string
+            - Name: useragent
+              Type: string
+            - Name: errorcode
+              Type: string
+            - Name: errormessage
+              Type: string
+            - Name: requestid
+              Type: string
+            - Name: eventid
+              Type: string
+            - Name: readonly
+              Type: string
+            - Name: eventtype
+              Type: string
+            - Name: recipientaccountid
+              Type: string
+
+  ############### [4부] 보안 서비스 (기본값: 생성 안 함) ###############
+
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Condition: CreateGuardDuty
+    Properties:
+      Enable: true
+
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Condition: CreateSecurityHub
+
+Outputs:
+  LogBucketName:
+    Value: !Ref LogBucket
+    Export:
+      Name: dso-base-LogBucket
+  AthenaResultBucketName:
+    Value: !Ref AthenaResultBucket
+    Export:
+      Name: dso-base-AthenaResultBucket
+  WorkGroupName:
+    Value: !Ref AthenaWorkGroup
+    Export:
+      Name: dso-base-WorkGroup
+  ConfigDatabaseName:
+    Value: !Ref ConfigLogDatabase
+    Export:
+      Name: dso-base-ConfigDatabase
+  ConfigTableName:
+    Value: config_flat_confighistory
+    Export:
+      Name: dso-base-ConfigTable
