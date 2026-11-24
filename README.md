@@ -13,7 +13,7 @@
 | 1 | Athena 파티션 프로젝션 | Config는 Lambda가 매일 파티션 등록, CloudTrail은 날짜마다 수동 등록 | ([링크](https://blog.naver.com/pandarimi/224467770051)) |
 | 2 | 파이프라인 자체 모니터링 | 알림 누락을 사람이 발견 | ([링크](https://blog.naver.com/pandarimi/224477225109)) |
 | 3 | S3 수명 주기 정책 | 로그 무기한 누적 | ([링크](https://blog.naver.com/pandarimi/224479861344)) |
-| 4 | 알림 메시지 개선 + 런북 | 알림만 오고 대응 기준 없음 | ([링크](https://blog.naver.com/pandarimi/224479861344)) |
+| 4 | 알림 메시지 개선 + 런북 | 알림만 오고 대응 기준 없음 | ([링크](https://blog.naver.com/pandarimi/224489153773)) |
 
 
 ## 아키텍처 (v2)
